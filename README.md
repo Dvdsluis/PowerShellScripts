@@ -1,4 +1,4 @@
-<#
+
 .SYNOPSIS
   Searches Azure resources for secrets containing specified keywords and generates an inventory.
 
@@ -45,4 +45,4 @@
   - Resource name
   - Setting name (if applicable)
   - Matching keyword
-#>
+
