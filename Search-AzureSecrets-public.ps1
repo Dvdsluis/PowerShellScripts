@@ -50,12 +50,13 @@
 
 [CmdletBinding()]
 param (
-    [string[]]$Keywords = @("AddKeywordhere"),
+    [string[]]$Keywords = @("KeyWordHere"),
     [string]$OutputFilePath
 )
 
 if (-not $OutputFilePath) {
-    $OutputFilePath = Join-Path -Path $PSScriptRoot -ChildPath "secrets-inventory.txt"
+    $defaultPath = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+    $OutputFilePath = Join-Path -Path $defaultPath -ChildPath "secrets-inventory.txt"
 }
 
 function Initialize-LogFile {
@@ -81,10 +82,16 @@ function Write-SecretFound {
         [string]$Keyword
     )
 
-    $settingInfo = if ($Setting) { "setting '$Setting'" } else { "" }
-    $message = "[$ResourceType] Secret found in '$ResourceName' $settingInfo containing keyword '$Keyword'"
-    Write-Output $message
-    Add-Content -Path $OutputFilePath -Value $message
+    # Split ResourceName if it contains spaces and process each name separately
+    $resourceNames = $ResourceName -split ' '
+    foreach ($name in $resourceNames) {
+        if ($name) {  # Skip empty strings
+            $settingInfo = if ($Setting) { "setting '$Setting'" } else { "" }
+            $message = "[$ResourceType] Secret found in '$name' $settingInfo containing keyword '$Keyword'"
+            Write-Output $message
+            Add-Content -Path $OutputFilePath -Value $message
+        }
+    }
 }
 
 function Search-AppSettings {
@@ -141,15 +148,22 @@ function Search-LogicApps {
     param ([string]$ResourceGroupName)
 
     Get-AzLogicApp -ResourceGroupName $ResourceGroupName | ForEach-Object {
-        $definitionJson = $_.Definition | ConvertTo-Json -Depth 100
-        foreach ($keyword in $Keywords) {
-            if ($definitionJson -cmatch $keyword) {
-                Write-SecretFound -ResourceType 'LogicApp' -ResourceName $_.Name -Keyword $keyword
-                break
+        try {
+            $definitionJson = $_.Definition | ConvertTo-Json -Depth 100 -Compress
+            foreach ($keyword in $Keywords) {
+                # Use regex to find exact matches, excluding matches in resource names or titles
+                if ($definitionJson -match "(?<![\w\-])`"$([regex]::Escape($keyword))`"") {
+                    Write-SecretFound -ResourceType 'LogicApp' -ResourceName $_.Name -Keyword $keyword
+                    break
+                }
             }
+        }
+        catch {
+            Write-Warning "Error processing Logic App $($_.Name): $_"
         }
     }
 }
+
 
 function Search-ResourceGroup {
     param ([string]$ResourceGroupName)
