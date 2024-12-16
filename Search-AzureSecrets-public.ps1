@@ -50,7 +50,7 @@
 
 [CmdletBinding()]
 param (
-    [string[]]$Keywords = @("InsertKeywordHere"),
+    [string[]]$Keywords = @("AddKeywordhere"),
     [string]$OutputFilePath
 )
 
@@ -156,7 +156,7 @@ function Search-ResourceGroup {
 
     foreach ($resourceType in @('WebApp', 'FunctionApp')) {
         try {
-            $apps = Get-AppSettings -ResourceGroupName $ResourceGroupName -ResourceType $resourceType
+            $apps = Search-WebApp-FunctionApps -ResourceGroupName $ResourceGroupName -ResourceType $resourceType
             foreach ($app in $apps) {
                 Search-AppSettings -AppSettings $app.Settings -AppName $app.Name -ResourceType $resourceType
             }
