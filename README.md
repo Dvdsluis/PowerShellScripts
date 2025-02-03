@@ -46,3 +46,69 @@
   - Setting name (if applicable)
   - Matching keyword
 
+---
+
+### Azure Network Resource Audit Tool
+
+#### SYNOPSIS
+Audits Azure network resources across all subscriptions to identify orphaned and unused components.
+
+#### DESCRIPTION
+This PowerShell script performs comprehensive network resource auditing:
+
+1. **Resource Types Audited**
+   - Network Security Groups (NSGs)
+   - Virtual Networks (VNets)
+   - Application Security Groups (ASGs)
+   - Public IP Addresses
+   - Load Balancers
+   - Application Gateways
+   - DNS Zones
+   - Network Interfaces (NICs)
+
+2. **Functionality**
+   - Scans all subscriptions
+   - Checks resource connectivity
+   - Identifies orphaned resources
+   - Validates resource configurations
+   - Color-coded status output
+   - CSV export of findings
+
+#### PREREQUISITES
+- Az PowerShell module
+- Azure account with appropriate permissions
+- PowerShell 5.1 or higher
+
+#### PARAMETERS
+None - Script runs against all accessible subscriptions
+
+#### USAGE
+```powershell
+.\Audit-AzureNetworkResources.ps1
+```
+
+#### OUTPUT
+- Console: Color-coded resource status
+- CSV file: Detailed audit results with timestamp
+  - Resource details
+  - Connection status
+  - Configuration counts
+  - Resource relationships
+
+#### EXAMPLE OUTPUT
+```
+[NSG] myNSG-prod : ✅ Connected
+[VNet] myVNet-prod : ✅ Connected
+[PublicIP] unused-ip : ❌ Orphaned
+```
+
+#### CSV FIELDS
+- SubscriptionName
+- ResourceName
+- ResourceType
+- ResourceGroup
+- Status
+- Additional type-specific details
+
+#### NOTE
+Script requires appropriate RBAC permissions across subscriptions for resource auditing.
