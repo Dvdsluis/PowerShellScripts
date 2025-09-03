@@ -1,0 +1,362 @@
+trigger:
+  branches:
+    include: [ gitleaks ]
+  paths:
+    include:
+      - "**/*.sln"
+      - "**/*.csproj"
+      - "**/*.cs"
+      - "**/*.props"
+      - "**/*.targets"
+      - "global.json"
+      - "gitleaks.toml"
+      - "azure-pipelines.yml"
+
+pr:
+  branches:
+    include: [ "*" ]
+  paths:
+    include:
+      - "**/*.sln"
+      - "**/*.csproj"
+      - "**/*.cs"
+      - "**/*.props"
+      - "**/*.targets"
+      - "global.json"
+      - "gitleaks.toml"
+      - "azure-pipelines.yml"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  # Gitleaks
+  GITLEAKS_VERSION: "8.18.2"
+  GITLEAKS_REPORT_DIR: '$(Agent.TempDirectory)/_security-reports'
+  GITLEAKS_SARIF: '$(GITLEAKS_REPORT_DIR)/gitleaks.sarif'
+  GITLEAKS_JSON:  '$(GITLEAKS_REPORT_DIR)/gitleaks.json'
+  # Set true for the FIRST run to create a baseline without failing
+  GITLEAKS_BOOTSTRAP: "true"
+
+  # .NET
+  CODEQL_LANGUAGES: "csharp"
+  BUILD_CONFIGURATION: "Release"
+
+  # Speed up dotnet
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+  # Toggles
+  RUN_BUILD_TEST: 'false'     # set to 'true' to run restore/build/test (+ CodeQL)
+  ENFORCE_GITLEAKS: 'true'    # set 'false' to not fail the job on new leaks
+
+stages:
+- stage: BuildAndScan
+  displayName: .NET Build + Security
+  jobs:
+  - job: build_scan
+    displayName: Build, Test, Gitleaks, MSDO
+    steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 0
+        clean: true
+
+      # --- Sanitize .sln (verwijder alleen écht missende csproj in workspace) ---
+      - bash: |
+          set -e
+          mapfile -t SLNS < <(find . -name '*.sln' | sort)
+          if [ ${#SLNS[@]} -eq 0 ]; then
+            echo "##vso[task.logissue type=error].sln not found"; exit 1
+          fi
+          for sln in "${SLNS[@]}"; do
+            echo "Sanitizing $sln"
+            SLNDIR=$(dirname "$sln")
+            mapfile -t PROJS < <(grep -oE '"[^"]+\.csproj"' "$sln" | tr -d '"' | sort -u || true)
+            for entry in "${PROJS[@]}"; do
+              entry_unix=$(printf '%s\n' "$entry" | tr '\\' '/')
+              abs1="$SLNDIR/$entry_unix"
+              abs2="$SLNDIR/$entry"
+              if [ -f "$abs1" ] || [ -f "$abs2" ]; then
+                echo "Found: $entry"
+                continue
+              fi
+              echo "Removing missing project from solution: $entry"
+              (cd "$SLNDIR" && dotnet sln "$(basename "$sln")" remove "$entry") || true
+            done
+          done
+        displayName: "Sanitize .sln files (safe Windows→Linux path handling)"
+
+      - task: UseDotNet@2
+        displayName: "Install .NET 8 SDK"
+        inputs:
+          packageType: sdk
+          version: 8.0.x
+
+      # --- NuGet cache key + cache ---
+      - bash: |
+          set -e
+          cd "$(Build.SourcesDirectory)"
+          FILES=$(git ls-files '**/*.sln' '**/*.csproj' '**/Directory.Packages.props' '**/packages.config' '**/NuGet.config' 'global.json' 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            FPKG="no-files"
+          else
+            FPKG=$( (printf "%s\n" $FILES; printf "%s\n" $FILES | xargs -r cat) | sha256sum | cut -d' ' -f1 )
+          fi
+          OS=$(uname -s)
+          KEY="nuget|$OS|$FPKG"
+          echo "Computed NuGet cache key: $KEY"
+          echo "##vso[task.setvariable variable=NUGET_CACHE_KEY]$KEY"
+        displayName: "Compute NuGet cache key"
+
+      - bash: |
+          set -e
+          mkdir -p "$(HOME)/.nuget/packages"
+        displayName: "Ensure NuGet cache folder exists"
+
+      - task: Cache@2
+        displayName: "Cache NuGet packages"
+        inputs:
+          key: '$(NUGET_CACHE_KEY)'
+          restoreKeys: |
+            nuget|$(Agent.OS)
+            nuget
+          path: '$(HOME)/.nuget/packages'
+
+      # --- Restore per project (optioneel, via toggle) ---
+      - bash: |
+          set -e
+          dotnet --info
+          mapfile -t ALL_CSProj < <(git ls-files '**/*.csproj' | sort)
+          if [ ${#ALL_CSProj[@]} -eq 0 ]; then
+            echo "##vso[task.logissue type=error]No .csproj files found in repo"; exit 1
+          fi
+          if [ "$(Build.Reason)" = "PullRequest" ]; then
+            git fetch origin $(System.PullRequest.TargetBranch):targetbranch
+            BASE=$(git merge-base HEAD targetbranch)
+            mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD -- '**/*.csproj' | sort -u)
+            if [ ${#CHANGED[@]} -gt 0 ]; then
+              echo "Changed .csproj files detected:"
+              printf ' - %s\n' "${CHANGED[@]}"
+              TARGETS=("${CHANGED[@]}")
+            else
+              echo "No changed .csproj in PR; building all."
+              TARGETS=("${ALL_CSProj[@]}")
+            fi
+          else
+            TARGETS=("${ALL_CSProj[@]}")
+          fi
+          echo "Restoring ${#TARGETS[@]} project(s)…"
+          for p in "${TARGETS[@]}"; do
+            echo "dotnet restore $p"
+            dotnet restore "$p" --nologo || echo "restore failed: $p (continuing)"
+          done
+        displayName: "dotnet restore (per project, no .sln)"
+        condition: and(succeeded(), eq(variables['RUN_BUILD_TEST'], 'true'))
+
+      # --- Gitleaks install ---
+      - bash: |
+          set -e
+          echo "Installing gitleaks ${GITLEAKS_VERSION}…"
+          cd $(Agent.TempDirectory)
+          curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+        displayName: "Install Gitleaks"
+
+      # --- Gitleaks detect (bootstrap of normaal) + redact ---
+      - bash: |
+          set -e
+          mkdir -p "$(GITLEAKS_REPORT_DIR)"
+          CONFIG_ARG=""
+          [ -f "$(Build.SourcesDirectory)/gitleaks.toml" ] && CONFIG_ARG="--config=$(Build.SourcesDirectory)/gitleaks.toml"
+
+          BASELINE_FILE="$(Build.SourcesDirectory)/gitleaks.baseline.json"
+          BASELINE_ARG=""
+          if [ -f "$BASELINE_FILE" ] && [ "${GITLEAKS_BOOTSTRAP}" != "true" ]; then
+            echo "Using baseline: $BASELINE_FILE"
+            BASELINE_ARG="--baseline-path=$BASELINE_FILE"
+          fi
+
+          set +e
+          if [ "${GITLEAKS_BOOTSTRAP}" = "true" ]; then
+            echo "BOOTSTRAP: volledige history, niet falen, baseline + SARIF genereren"
+            # 1) JSON (baseline)
+            gitleaks detect $CONFIG_ARG --redact --report-format json  --report-path "$(GITLEAKS_JSON)"  --log-opts="--all"
+            # 2) SARIF (UI)
+            gitleaks detect $CONFIG_ARG --redact --report-format sarif --report-path "$(GITLEAKS_SARIF)" --log-opts="--all"
+
+            if [ -s "$(GITLEAKS_JSON)" ]; then
+              cp "$(GITLEAKS_JSON)" "$BASELINE_FILE"
+            else
+              echo "[]" > "$BASELINE_FILE"
+            fi
+
+            echo "##vso[task.setvariable variable=GITLEAKS_EXITCODE]0"
+            echo "##vso[task.complete result=SucceededWithIssues;]Bootstrap klaar; baseline gemaakt."
+            exit 0
+          fi
+
+          # Normale modus (met baseline)
+          if [ "$(Build.Reason)" = "PullRequest" ]; then
+            git fetch origin $(System.PullRequest.TargetBranch):targetbranch
+            BASE=$(git merge-base HEAD targetbranch)
+            gitleaks detect $CONFIG_ARG $BASELINE_ARG --redact --report-format sarif --report-path "$(GITLEAKS_SARIF)" --log-opts="--no-merges $BASE..HEAD"
+            RC=$?
+            gitleaks detect $CONFIG_ARG $BASELINE_ARG --redact --report-format json  --report-path "$(GITLEAKS_JSON)" --log-opts="--no-merges $BASE..HEAD" >/dev/null 2>&1
+          else
+            gitleaks detect $CONFIG_ARG $BASELINE_ARG --redact --report-format sarif --report-path "$(GITLEAKS_SARIF)" --log-opts="--all"
+            RC=$?
+            gitleaks detect $CONFIG_ARG $BASELINE_ARG --redact --report-format json  --report-path "$(GITLEAKS_JSON)" --log-opts="--all" >/dev/null 2>&1
+          fi
+
+          echo "##vso[task.setvariable variable=GITLEAKS_EXITCODE]$RC"
+          exit 0
+        displayName: "Run Gitleaks (rapport + baseline, niet-blokkerend)"
+
+      # --- Publiceer Gitleaks als pipeline artifact ---
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish Gitleaks reports"
+        inputs:
+          targetPath: '$(GITLEAKS_REPORT_DIR)'
+          artifact: 'gitleaks'
+
+      # --- Stage SARIF naar CodeAnalysisLogs (Scans-tab extensie) ---
+      - bash: |
+          set -e
+          B="$(Build.ArtifactStagingDirectory)/CodeAnalysisLogs"
+          mkdir -p "$B"
+          [ -f "$(GITLEAKS_SARIF)" ] && cp "$(GITLEAKS_SARIF)" "$B/gitleaks.sarif" || true
+          # MSDO SARIF wordt later ook toegevoegd; dit is alvast de map.
+        displayName: "Stage SARIF for Scans tab"
+        condition: always()
+
+      - task: PublishBuildArtifacts@1
+        displayName: "Publish SARIF to CodeAnalysisLogs (Scans tab)"
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/CodeAnalysisLogs'
+          ArtifactName: 'CodeAnalysisLogs'
+        condition: always()
+
+      # --- (Optioneel) Build & Test ---
+      - bash: |
+          set -e
+          git fetch origin $(System.PullRequest.TargetBranch):targetbranch
+          BASE=$(git merge-base HEAD targetbranch)
+          mapfile -t SLNS < <(git diff --name-only "$BASE"...HEAD -- '**/*.sln' | sort -u)
+          if [ ${#SLNS[@]} -eq 0 ]; then
+            echo "No solution changes; falling back to all solutions."
+            mapfile -t SLNS < <(find . -name '*.sln' | sort)
+          fi
+          for s in "${SLNS[@]}"; do
+            echo "Building $s"
+            if ! dotnet build "$s" -c $(BUILD_CONFIGURATION) --no-restore --nologo; then
+              echo "Build failed for $s (continuing)"; continue
+            fi
+            echo "Testing $s"
+            dotnet test "$s" -c $(BUILD_CONFIGURATION) --no-build --nologo \
+              --logger "trx;LogFileName=$(basename "$s").trx" \
+              --collect "XPlat Code Coverage" || echo "Tests failed in $s (continuing)"
+          done
+        displayName: "dotnet build/test (changed solutions)"
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['RUN_BUILD_TEST'], 'true'))
+
+      - bash: |
+          set -e
+          mapfile -t SLNS < <(find . -name '*.sln' | sort)
+          for s in "${SLNS[@]}"; do
+            echo "Building $s"
+            if ! dotnet build "$s" -c $(BUILD_CONFIGURATION) --no-restore --nologo; then
+              echo "Build failed for $s (continuing)"; continue
+            fi
+            echo "Testing $s"
+            dotnet test "$s" -c $(BUILD_CONFIGURATION) --no-build --nologo \
+              --logger "trx;LogFileName=$(basename "$s").trx" \
+              --collect "XPlat Code Coverage" || echo "Tests failed in $s (continuing)"
+          done
+        displayName: "dotnet build/test (all solutions)"
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['RUN_BUILD_TEST'], 'true'))
+
+      - task: PublishTestResults@2
+        displayName: "Publish test results"
+        condition: and(succeeded(), eq(variables['RUN_BUILD_TEST'], 'true'))
+        inputs:
+          testResultsFormat: "VSTest"
+          testResultsFiles: "**/*.trx"
+          searchFolder: "$(System.DefaultWorkingDirectory)"
+          testRunTitle: "$(Build.BuildNumber)"
+          mergeTestResults: true
+          failTaskOnFailedTests: true
+
+      # --- MSDO: CredScan (altijd) ---
+      - task: UseDotNet@2
+        displayName: "Install .NET 6 runtime (for CredScan)"
+        inputs:
+          packageType: runtime
+          version: 6.0.x
+
+      - task: MicrosoftSecurityDevOps@1
+        displayName: "MSDO – CredScan"
+        inputs:
+          tools: "credscan"
+          languages: "$(CODEQL_LANGUAGES)"
+          publish: true
+        continueOnError: true
+        condition: succeeded()
+
+      # --- MSDO: CodeQL (alleen met build/test) ---
+      - task: MicrosoftSecurityDevOps@1
+        displayName: "MSDO – CodeQL (C#)"
+        inputs:
+          tools: "codeql"
+          languages: "$(CODEQL_LANGUAGES)"
+          publish: true
+        continueOnError: true
+        condition: and(succeeded(), eq(variables['RUN_BUILD_TEST'], 'true'))
+
+      # --- Voeg MSDO SARIF ook toe aan CodeAnalysisLogs (Scans-tab) ---
+      - bash: |
+          set -e
+          SRC="$(Build.ArtifactStagingDirectory)/.gdn/msdo.sarif"
+          DST_DIR="$(Build.ArtifactStagingDirectory)/CodeAnalysisLogs"
+          if [ -f "$SRC" ]; then
+            mkdir -p "$DST_DIR"
+            cp "$SRC" "$DST_DIR/msdo.sarif"
+          fi
+        displayName: "Stage MSDO SARIF for Scans tab"
+        condition: always()
+
+      - task: PublishBuildArtifacts@1
+        displayName: "Publish SARIF to CodeAnalysisLogs (append)"
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/CodeAnalysisLogs'
+          ArtifactName: 'CodeAnalysisLogs'
+        condition: always()
+
+      # --- Print korte Gitleaks summary in logs ---
+      - bash: |
+          set -e
+          FILE="$(GITLEAKS_SARIF)"
+          if [ -f "$FILE" ]; then
+            echo "Gitleaks: top 20 findings"
+            jq -r '.runs[0].results[] | "\(.ruleId)\t\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)\t\(.message.text)"' "$FILE" | head -20 || true
+          else
+            echo "No Gitleaks SARIF found at $FILE"
+          fi
+        displayName: "Print Gitleaks summary"
+        condition: always()
+
+      # --- Gate: faal alleen als enforcement aan staat en Gitleaks iets vond ---
+      - bash: |
+          echo "GITLEAKS_EXITCODE=$(GITLEAKS_EXITCODE)"
+          echo "ENFORCE_GITLEAKS=$(ENFORCE_GITLEAKS)"
+          if [ "$(ENFORCE_GITLEAKS)" = "true" ] && [ "$(GITLEAKS_EXITCODE)" != "0" ]; then
+            echo "Nieuwe Gitleaks findings en ENFORCE_GITLEAKS=true -> failing."
+            exit 1
+          else
+            echo "Geen enforced failure (geen nieuwe leaks of enforcement uit)."
+          fi
+        displayName: "Gate: fail on Gitleaks (after reports & MSDO)"
+        condition: always()
