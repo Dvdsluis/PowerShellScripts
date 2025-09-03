@@ -1,128 +1,107 @@
-# Function for colored status output
-function Write-ColorStatus {
-  param (
-      [string]$Status,
-      [string]$ResourceName,
-      [string]$ResourceType
-  )
-  $message = "[$ResourceType] $ResourceName : $Status"
-  switch -Wildcard ($Status) {
-      "*✅*" { Write-Host $message -ForegroundColor Green }
-      "*❌*" { Write-Host $message -ForegroundColor Red }
-      "*⚠️*" { Write-Host $message -ForegroundColor Yellow }
-      default { Write-Host $message }
-  }
+function Write-Status {
+    param (
+        [string]$Status,
+        [string]$Name,
+        [string]$Type
+    )
+    $msg = "[${Type}] ${Name} : ${Status}"
+    switch ($Status) {
+        "Connected" { Write-Host $msg -ForegroundColor Green }
+        "Orphaned"  { Write-Host $msg -ForegroundColor Red }
+        default     { Write-Host $msg }
+    }
 }
 
-# Initialize Azure connection
-try {
-  Get-AzContext
-} catch {
-  Connect-AzAccount
+# Ensure Azure context is available
+if (-not (Get-AzContext)) {
+    Connect-AzAccount | Out-Null
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outputPath = "NetworkResourcesAudit_$timestamp.csv"
-$masterResults = @()
-$subscriptions = Get-AzSubscription
+$results = @()
 
-foreach ($sub in $subscriptions) {
-  try {
-      Set-AzContext -Subscription $sub.Id
-      Write-Host "`nChecking subscription: $($sub.Name)" -ForegroundColor Cyan
+foreach ($sub in Get-AzSubscription) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+    Write-Host "`nSubscription: $($sub.Name)" -ForegroundColor Cyan
 
-      # Get all resources
-      $nsgs = Get-AzNetworkSecurityGroup
-      $asgs = Get-AzApplicationSecurityGroup
-      $vnets = Get-AzVirtualNetwork
-      $publicIps = Get-AzPublicIpAddress
-      $vms = Get-AzVM
-      $loadBalancers = Get-AzLoadBalancer
-      $appGateways = Get-AzApplicationGateway
-      $dnsZones = Get-AzDnsZone
-      $nics = Get-AzNetworkInterface
+    $nsgs          = Get-AzNetworkSecurityGroup
+    $vnets         = Get-AzVirtualNetwork
+    $publicIps     = Get-AzPublicIpAddress
+    $loadBalancers = Get-AzLoadBalancer
+    $appGateways   = Get-AzApplicationGateway
 
-      # Check NSGs
-      foreach ($nsg in $nsgs) {
-          $status = if ($nsg.Subnets.Count -gt 0 -or $nsg.NetworkInterfaces.Count -gt 0) { "✅ Connected" } else { "❌ Orphaned" }
-          Write-ColorStatus -Status $status -ResourceName $nsg.Name -ResourceType "NSG"
-          $masterResults += [PSCustomObject]@{
-              SubscriptionName = $sub.Name
-              ResourceName = $nsg.Name
-              ResourceType = "NSG"
-              ResourceGroup = $nsg.ResourceGroupName
-              Status = $status
-              SubnetCount = $nsg.Subnets.Count
-              NICCount = $nsg.NetworkInterfaces.Count
-          }
-      }
+    foreach ($nsg in $nsgs) {
+        $status = if ($nsg.Subnets.Count -gt 0 -or $nsg.NetworkInterfaces.Count -gt 0) { "Connected" } else { "Orphaned" }
+        Write-Status $status $nsg.Name "NSG"
+        $results += [PSCustomObject]@{
+            Subscription = $sub.Name
+            Type         = "NSG"
+            Name         = $nsg.Name
+            Group        = $nsg.ResourceGroupName
+            Status       = $status
+            Subnets      = $nsg.Subnets.Count
+            NICs         = $nsg.NetworkInterfaces.Count
+        }
+    }
 
-      # Check VNets
-      foreach ($vnet in $vnets) {
-          $connectedSubnets = $vnet.Subnets | Where-Object { $_.IpConfigurations.Count -gt 0 }
-          $status = if ($connectedSubnets.Count -gt 0) { "✅ Connected" } else { "❌ Orphaned" }
-          Write-ColorStatus -Status $status -ResourceName $vnet.Name -ResourceType "VNet"
-          $masterResults += [PSCustomObject]@{
-              SubscriptionName = $sub.Name
-              ResourceName = $vnet.Name
-              ResourceType = "VNet"
-              ResourceGroup = $vnet.ResourceGroupName
-              Status = $status
-              SubnetCount = $vnet.Subnets.Count
-              UsedSubnets = $connectedSubnets.Count
-          }
-      }
+    foreach ($vnet in $vnets) {
+        $usedSubnets = ($vnet.Subnets | Where-Object { $_.IpConfigurations.Count -gt 0 }).Count
+        $status = if ($usedSubnets -gt 0) { "Connected" } else { "Orphaned" }
+        Write-Status $status $vnet.Name "VNet"
+        $results += [PSCustomObject]@{
+            Subscription = $sub.Name
+            Type         = "VNet"
+            Name         = $vnet.Name
+            Group        = $vnet.ResourceGroupName
+            Status       = $status
+            TotalSubnets = $vnet.Subnets.Count
+            UsedSubnets  = $usedSubnets
+        }
+    }
 
-      # Check Public IPs
-      foreach ($pip in $publicIps) {
-          $status = if ($pip.IpConfiguration) { "✅ Connected" } else { "❌ Orphaned" }
-          Write-ColorStatus -Status $status -ResourceName $pip.Name -ResourceType "PublicIP"
-          $masterResults += [PSCustomObject]@{
-              SubscriptionName = $sub.Name
-              ResourceName = $pip.Name
-              ResourceType = "PublicIP"
-              ResourceGroup = $pip.ResourceGroupName
-              Status = $status
-              IPAddress = $pip.IpAddress
-              AssociatedTo = $pip.IpConfiguration.Id
-          }
-      }
+    foreach ($pip in $publicIps) {
+        $status = if ($pip.IpConfiguration) { "Connected" } else { "Orphaned" }
+        Write-Status $status $pip.Name "PublicIP"
+        $results += [PSCustomObject]@{
+            Subscription = $sub.Name
+            Type         = "PublicIP"
+            Name         = $pip.Name
+            Group        = $pip.ResourceGroupName
+            Status       = $status
+            IPAddress    = $pip.IpAddress
+            LinkedTo     = $pip.IpConfiguration.Id
+        }
+    }
 
-      # Check Load Balancers
-      foreach ($lb in $loadBalancers) {
-          $status = if ($lb.BackendAddressPools.Count -gt 0) { "✅ Connected" } else { "❌ Orphaned" }
-          Write-ColorStatus -Status $status -ResourceName $lb.Name -ResourceType "LoadBalancer"
-          $masterResults += [PSCustomObject]@{
-              SubscriptionName = $sub.Name
-              ResourceName = $lb.Name
-              ResourceType = "LoadBalancer"
-              ResourceGroup = $lb.ResourceGroupName
-              Status = $status
-              FrontendCount = $lb.FrontendIpConfigurations.Count
-              BackendCount = $lb.BackendAddressPools.Count
-          }
-      }
+    foreach ($lb in $loadBalancers) {
+        $status = if ($lb.BackendAddressPools.Count -gt 0) { "Connected" } else { "Orphaned" }
+        Write-Status $status $lb.Name "LoadBalancer"
+        $results += [PSCustomObject]@{
+            Subscription = $sub.Name
+            Type         = "LoadBalancer"
+            Name         = $lb.Name
+            Group        = $lb.ResourceGroupName
+            Status       = $status
+            Frontends    = $lb.FrontendIpConfigurations.Count
+            Backends     = $lb.BackendAddressPools.Count
+        }
+    }
 
-      # Check Application Gateways
-      foreach ($agw in $appGateways) {
-          $status = if ($agw.BackendAddressPools.Count -gt 0) { "✅ Connected" } else { "❌ Orphaned" }
-          Write-ColorStatus -Status $status -ResourceName $agw.Name -ResourceType "AppGateway"
-          $masterResults += [PSCustomObject]@{
-              SubscriptionName = $sub.Name
-              ResourceName = $agw.Name
-              ResourceType = "AppGateway"
-              ResourceGroup = $agw.ResourceGroupName
-              Status = $status
-              BackendPools = $agw.BackendAddressPools.Count
-              State = $agw.OperationalState
-          }
-      }
-
-  } catch {
-      Write-Host "Error processing subscription $($sub.Name): $_" -ForegroundColor Red
-  }
+    foreach ($agw in $appGateways) {
+        $status = if ($agw.BackendAddressPools.Count -gt 0) { "Connected" } else { "Orphaned" }
+        Write-Status $status $agw.Name "AppGateway"
+        $results += [PSCustomObject]@{
+            Subscription = $sub.Name
+            Type         = "AppGateway"
+            Name         = $agw.Name
+            Group        = $agw.ResourceGroupName
+            Status       = $status
+            Backends     = $agw.BackendAddressPools.Count
+        }
+    }
 }
 
-# Export results
-$masterResults | Export-Csv -Path $outputPath -NoTypeInformation
-Write-Host "`nAudit completed. Results exported to: $outputPath" -ForegroundColor Green
+# Optional: export results
+$results | Export-Csv -Path $outputPath -NoTypeInformation
+Write-Host "`nAudit complete. Results saved to $outputPath" -ForegroundColor Gray
